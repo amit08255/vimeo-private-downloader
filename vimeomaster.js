@@ -62,12 +62,38 @@ function loadVideo(num, cb) {
   });
 }
 
+function mergeSegments(segmentsUrl, output, filename){
+  for(let i = 0; i < segmentsUrl.length; i++){
+      const segmentFileName = `${filename}.part${i}`;
+
+      if(fs.existsSync(segmentFileName) !== true){
+          continue;
+      }
+
+      output.write(fs.readFileSync(segmentFileName));
+
+      fs.unlinkSync(segmentFileName);
+  }
+}
+
+function findLastSegment(segmentsUrl, filename){
+  for(let i = segmentsUrl.length - 1; i >= 0; i--){
+      const segmentFileName = `${filename}.part${i}`;
+
+      if(fs.existsSync(segmentFileName) === true){
+          return i;
+      }
+  }
+
+  return 0;
+}
+
 function processFile(type, baseUrl, initData, segments, filename, cb) {
   const filePath = `./parts/${filename}`;
   const downloadingFlag = `./parts/.${filename}~`;
   
   if(fs.existsSync(downloadingFlag)) {
-    log("⚠️", ` ${filename} - ${type} is incomplete, restarting the download`);
+    log("⚠️", ` ${filename} - ${type} is incomplete, restarting/resuming the download`);
   } else if (fs.existsSync(filePath)) {
     log("⚠️", ` ${filename} - ${type} already exists`);
     return cb();
@@ -84,14 +110,51 @@ function processFile(type, baseUrl, initData, segments, filename, cb) {
     flags: "a"
   });
 
-  combineSegments(type, 0, segmentsUrl, output, filePath, downloadingFlag, err => {
+  const lastSegment = findLastSegment(segmentsUrl, filePath);
+
+  if(lastSegment > 0){
+      log("⚠️ Resuming download from last segment...");
+  }
+
+  combineSegments(type, lastSegment, segmentsUrl, output, filePath, downloadingFlag, err => {
     if (err) {
       log("⚠️", ` ${err}`);
     }
 
+    mergeSegments(segmentsUrl, output, filePath);
+
     output.end();
     cb();
   });
+}
+
+function downloadSegment(type, i, segmentsUrl, output, filename, downloadingFlag, cb, retry = 0){
+  const retryLimit = 99;
+
+  const segmentFileName = `${filename}.part${i}`;
+
+  const segmentOutput = fs.createWriteStream(segmentFileName, {
+      flags: "w"
+  });
+
+  https
+    .get(segmentsUrl[i], res => {
+      res.on("data", d => segmentOutput.write(d));
+
+      res.on("end", () =>{
+        segmentOutput.end();
+        combineSegments(type, i + 1, segmentsUrl, output, filename, downloadingFlag, cb)
+      });
+    })
+    .on("error", e => {
+        if(retry < retryLimit){
+          log(`\n\n⚠️ Downloading segment ${i} failed: Retrying ${retry + 1}: \n\n ${e}\n\n`);
+          downloadSegment(type, i, segmentsUrl, output, filename, downloadingFlag, cb, retry + 1);
+        }
+        else{
+          cb(e);
+        }
+    });
 }
 
 function combineSegments(type, i, segmentsUrl, output, filename, downloadingFlag, cb) {
@@ -107,17 +170,7 @@ function combineSegments(type, i, segmentsUrl, output, filename, downloadingFlag
     `Downloading ${type} segment ${i}/${segmentsUrl.length} of ${filename}`
   );
 
-  https
-    .get(segmentsUrl[i], res => {
-      res.on("data", d => output.write(d));
-
-      res.on("end", () =>
-        combineSegments(type, i + 1, segmentsUrl, output, filename, downloadingFlag, cb)
-      );
-    })
-    .on("error", e => {
-      cb(e);
-    });
+  downloadSegment(type, i, segmentsUrl, output, filename, downloadingFlag, cb);
 }
 
 function getJson(url, cb) {
